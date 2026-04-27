@@ -10,13 +10,20 @@ events are rare, and the boss is always last.
 Zone entry is gated by:
   1. The previous zone's boss must have been recorded as defeated.
   2. The player must meet the minimum combat level for the zone.
+
+Integrated systems:
+  - LootResolver   — resolves all item/currency drops
+  - SkillChallenge — drives skill-room mini-game resolution
+  - MerchantShop   — generates a shop for merchant event rooms
+  - ProgressionManager (optional) — records kills, boss kills, run outcomes
+  - Bestiary (optional)           — records monster encounters
 """
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Optional
+from enum import Enum
+from typing import TYPE_CHECKING
 
 from core.events import bus, GameEvent, EVT_DUNGEON_COMPLETE, EVT_DROP_RECEIVED
 from data.monsters import (
@@ -27,6 +34,11 @@ from data.monsters import (
 from entities.monster import MonsterInstance, BossInstance
 from entities.player import Player
 from systems.combat import CombatEngine, CombatResult
+
+if TYPE_CHECKING:
+    from systems.progression import ProgressionManager
+    from systems.bestiary import Bestiary
+    from systems.merchant import MerchantShop
 
 
 class RoomType(Enum):
@@ -94,8 +106,8 @@ def can_enter_zone(
     """
     Returns (can_enter, reason_if_not).
 
-    `defeated_boss_ids` is a persistent set on the player's save of all boss IDs
-    they have killed across previous runs.
+    `defeated_boss_ids` is the persistent set of boss IDs killed across runs
+    (typically stored in ProgressionManager.defeated_bosses).
     """
     from data.zones import ZONES
     zone = ZONES.get(zone_id)
@@ -115,7 +127,6 @@ def can_enter_zone(
             f"Need Combat Level {unlock.min_combat_level} "
             f"(you have {cb}). {unlock.description}"
         )
-
     return True, ""
 
 
@@ -125,9 +136,6 @@ class DungeonGenerator:
     """Builds a randomised room sequence for a zone."""
 
     def generate(self, zone: str) -> DungeonRun:
-        from data.zones import ZONES
-        zone_def = ZONES.get(zone)
-
         zone_monsters = get_monsters_by_zone(zone)
         normal_monsters = [m for m in zone_monsters
                            if not m.is_boss and not m.is_elite and not m.is_rare]
@@ -136,7 +144,7 @@ class DungeonGenerator:
         boss            = get_boss_for_zone(zone)
 
         rooms: list[Room] = []
-        num_combat    = random.randint(4, 8)
+        num_combat     = random.randint(4, 8)
         skill_room_pos = random.randint(1, num_combat - 1)
         event_room_pos = random.randint(1, num_combat - 1) if random.random() < 0.35 else -1
         loot_room_pos  = random.randint(1, num_combat - 1) if random.random() < 0.25 else -1
@@ -202,17 +210,17 @@ class DungeonGenerator:
 
 class DungeonRunner:
     """
-    Drives a dungeon run — connects rooms to combat engine, loot, and events.
+    Drives a dungeon run — connects rooms to combat, loot, skill, and events.
 
     Parameters
     ----------
-    player          : Player instance (modified in-place)
-    zone            : Zone ID string
-    luck            : Float [0.0, 1.0] — luck modifier for LootResolver
-    bestiary        : Optional Bestiary — if provided, kills are recorded
-    defeated_bosses : Set of boss IDs already killed (used for unlock check at
-                      construction time; caller can pre-validate with
-                      can_enter_zone() to show a cleaner error)
+    player      : Player instance (modified in-place)
+    zone        : Zone ID string
+    luck        : Float [0.0, 1.0] — luck modifier for LootResolver
+    bestiary    : Optional Bestiary — records monster encounters
+    progression : Optional ProgressionManager — records kills, boss kills,
+                  run start (called automatically in __init__)
+    defeated_bosses : Set of boss IDs already killed (used for unlock gating)
     """
 
     def __init__(
@@ -220,22 +228,33 @@ class DungeonRunner:
         player: Player,
         zone: str,
         luck: float = 0.0,
-        bestiary=None,
+        bestiary: "Bestiary | None" = None,
+        progression: "ProgressionManager | None" = None,
         defeated_bosses: set[str] | None = None,
     ) -> None:
-        self.player  = player
-        self.zone    = zone
-        self.luck    = luck
-        self.bestiary = bestiary
-        self.defeated_bosses: set[str] = defeated_bosses or set()
+        self.player      = player
+        self.zone        = zone
+        self.luck        = luck
+        self.bestiary    = bestiary
+        self.progression = progression
+        self.defeated_bosses: set[str] = (
+            defeated_bosses
+            if defeated_bosses is not None
+            else (progression.defeated_bosses if progression else set())
+        )
 
         generator = DungeonGenerator()
         self.run = generator.generate(zone)
-        # _loot is initialised lazily via the property (so __new__ callers work too)
+        # _loot, _merchant lazily initialised via properties below
+
+        if self.progression:
+            self.progression.record_run_start(zone)
 
     @property
     def current_room(self) -> Room | None:
         return self.run.current_room
+
+    # ─── Lazy helpers ─────────────────────────────────────────────────────
 
     @property
     def _loot(self):
@@ -262,22 +281,24 @@ class DungeonRunner:
                 "monster": room.monster.name if room.monster else "Unknown enemy",
                 "weaknesses": self._weakness_dict(room.monster),
             }
-        elif room.room_type == RoomType.BOSS:
+        if room.room_type == RoomType.BOSS:
             return {
                 "type": "boss",
                 "boss": room.monster.name if room.monster else "Unknown boss",
                 "phases": len(room.monster.phases) if hasattr(room.monster, "phases") else 1,
             }
-        elif room.room_type == RoomType.SKILL:
+        if room.room_type == RoomType.SKILL:
             from data.zones import ZONES
             zone_def = ZONES.get(self.zone)
-            skill_name = (
-                zone_def.skill_challenge.value if zone_def else "mining"
-            )
-            return {"type": "skill", "skill": skill_name}
-        elif room.room_type == RoomType.LOOT:
+            skill = zone_def.skill_challenge if zone_def else None
+            return {
+                "type": "skill",
+                "skill": skill.value if skill else "unknown",
+                "description": f"A {skill.value.capitalize()} challenge blocks your path." if skill else "",
+            }
+        if room.room_type == RoomType.LOOT:
             return {"type": "loot", "drops": [d.item_id for d in room.loot]}
-        elif room.room_type == RoomType.EVENT:
+        if room.room_type == RoomType.EVENT:
             return {
                 "type": "event",
                 "event": room.event_type.value if room.event_type else "unknown",
@@ -304,14 +325,15 @@ class DungeonRunner:
         return engine
 
     def resolve_combat(self, engine: CombatEngine) -> dict:
-        """Call after combat finishes. Handles drops, XP, advance, and bestiary."""
+        """Call after combat finishes. Updates drops, XP, bestiary, progression."""
         result = engine.result
         room   = self.current_room
 
         if result == CombatResult.PLAYER_WIN:
             monster_def = engine.enemy.definition
-            is_boss     = isinstance(monster_def, BossDefinition) or monster_def.is_boss
-            is_special  = getattr(monster_def, "is_elite", False) or getattr(monster_def, "is_rare", False)
+            is_boss    = isinstance(monster_def, BossDefinition) or monster_def.is_boss
+            is_special = (getattr(monster_def, "is_elite", False)
+                          or getattr(monster_def, "is_rare", False))
 
             # --- XP ---
             xp_gain = engine.enemy.xp_reward
@@ -320,24 +342,14 @@ class DungeonRunner:
             self.player.skills.add_xp(SkillType.DEFENSE,  xp_gain // 4)
             self.player.skills.add_xp(SkillType.STRENGTH, xp_gain // 4)
 
-            # --- Loot (using LootResolver) ---
+            # --- Loot ---
             self._loot.depth = self.run.current_room_index
-            if is_special:
-                loot_result = self._loot.resolve_special_monster(monster_def)
-            else:
-                loot_result = self._loot.resolve_kill(monster_def)
-
+            loot_result = (
+                self._loot.resolve_special_monster(monster_def) if is_special
+                else self._loot.resolve_kill(monster_def)
+            )
             overflow = self._apply_loot(loot_result)
 
-            # Track boss kill for zone unlock
-            if is_boss:
-                self.defeated_bosses.add(monster_def.id)
-
-            # Record in bestiary
-            if self.bestiary is not None:
-                self.bestiary.record_kill(monster_def.id, self.zone)
-
-            # Build drop summary for callers
             drops = [
                 {"item_id": d.item_id, "quantity": d.quantity, "rarity": d.rarity.value}
                 for d in loot_result.dropped_items
@@ -351,6 +363,18 @@ class DungeonRunner:
                 "gold": loot_result.gold,
             }))
 
+            # --- Progression / bestiary ---
+            if self.progression:
+                self.progression.record_kill(self.zone)
+                if is_boss:
+                    self.progression.record_boss_kill(monster_def.id, self.zone)
+
+            if self.bestiary is not None:
+                self.bestiary.record_kill(monster_def.id, self.zone)
+
+            if is_boss:
+                self.defeated_bosses.add(monster_def.id)
+
             room.completed = True
             self.run.advance()
             self._check_dungeon_complete()
@@ -363,22 +387,76 @@ class DungeonRunner:
                 "gold": loot_result.gold,
                 "overflow": overflow,
                 "is_boss": is_boss,
+                "boss_id": monster_def.id if is_boss else None,
             }
 
-        elif result == CombatResult.PLAYER_FLED:
+        if result == CombatResult.PLAYER_FLED:
             room.completed = True
             self.run.advance()
             return {"result": "fled"}
 
-        elif result == CombatResult.PLAYER_DEAD:
+        if result == CombatResult.PLAYER_DEAD:
             self.run.player_died = True
             self.run.is_complete = True
             self.player.die()
+            if self.progression:
+                self.progression.record_death(self.zone)
             return {"result": "dead", "message": "You died. All run drops lost."}
 
         return {"result": "unknown"}
 
-    # ─── Room interactions ────────────────────────────────────────────────
+    # ─── Skill room ───────────────────────────────────────────────────────
+
+    def complete_skill_room(self, precision: float) -> dict:
+        """
+        Attempt the skill-room challenge with a precision float (0.0–1.0).
+
+        Returns:
+          On pass : {"success": True, "xp": int, "quality": float,
+                     "narrative": str, "bonus_items": list[str], "skill": str}
+          On fail : {"blocked": True, "narrative": str, "xp": int, "skill": str}
+          On error: {"error": str}
+        """
+        room = self.current_room
+        if not room or room.room_type != RoomType.SKILL:
+            return {"error": "Not a skill room"}
+
+        from data.zones import ZONES
+        from systems.skill_challenge import SkillChallenge
+        zone_def = ZONES.get(self.zone)
+        skill = zone_def.skill_challenge if zone_def else None
+        if skill is None:
+            from core.constants import SkillType
+            skill = SkillType.MINING
+
+        skill_level = self.player.skills.level(skill)
+        challenge   = SkillChallenge()
+        result      = challenge.attempt(skill, skill_level, precision)
+
+        # Always grant at least consolation XP
+        self.player.skills.add_xp(skill, result.xp_gained)
+
+        if not result.passed:
+            return {
+                "blocked":   True,
+                "narrative": result.narrative,
+                "xp":        result.xp_gained,
+                "skill":     skill.value,
+            }
+
+        # Bonus raw resource items (go to hub storage, not inventory)
+        room.completed = True
+        self.run.advance()
+        return {
+            "success":     True,
+            "narrative":   result.narrative,
+            "xp":          result.xp_gained,
+            "quality":     result.quality,
+            "bonus_items": result.bonus_items,
+            "skill":       skill.value,
+        }
+
+    # ─── Loot room ────────────────────────────────────────────────────────
 
     def collect_loot_room(self) -> dict:
         room = self.current_room
@@ -394,15 +472,7 @@ class DungeonRunner:
         self.run.advance()
         return {"drops": drops, "zone_currency": loot_result.zone_currency}
 
-    def complete_skill_room(self, success: bool) -> dict:
-        room = self.current_room
-        if not room or room.room_type != RoomType.SKILL:
-            return {"error": "Not a skill room"}
-        if not success:
-            return {"blocked": True, "message": "Complete the skill challenge to proceed."}
-        room.completed = True
-        self.run.advance()
-        return {"success": True}
+    # ─── Event rooms ──────────────────────────────────────────────────────
 
     def handle_trap_event(self) -> dict:
         damage, loot_result = self._loot.resolve_trap(self.player.hp)
@@ -429,18 +499,35 @@ class DungeonRunner:
         if room:
             room.completed = True
             self.run.advance()
-        return {
-            "drops": drops,
-            "zone_currency": loot_result.zone_currency,
-        }
+        return {"drops": drops, "zone_currency": loot_result.zone_currency}
+
+    def get_merchant_shop(self) -> "MerchantShop | None":
+        """
+        Returns a MerchantShop for the current room if it is a merchant event.
+        The shop is cached on the room so repeated calls return the same stock.
+        """
+        room = self.current_room
+        if not room or room.event_type != EventType.MERCHANT:
+            return None
+        if not hasattr(room, "_merchant"):
+            from systems.merchant import MerchantShop
+            room._merchant = MerchantShop(self.zone)
+        return room._merchant
+
+    def dismiss_merchant(self) -> dict:
+        """Advance past the merchant room without buying anything."""
+        room = self.current_room
+        if not room or room.event_type != EventType.MERCHANT:
+            return {"error": "Not a merchant room"}
+        room.completed = True
+        self.run.advance()
+        return {"dismissed": True}
 
     # ─── Internal helpers ─────────────────────────────────────────────────
 
     def _apply_loot(self, loot_result) -> list[str]:
-        """Apply a LootResult to the player. Returns list of overflow item IDs."""
         from systems.loot import LootResolver
-        overflow = LootResolver.apply_to_player(loot_result, self.player)
-        return overflow
+        return LootResolver.apply_to_player(loot_result, self.player)
 
     def _check_dungeon_complete(self) -> None:
         if self.current_room is None:
@@ -454,14 +541,14 @@ class DungeonRunner:
         if monster is None:
             return {}
         from core.constants import CombatStyle
-        result = {}
+        out = {}
         for style in CombatStyle:
             default = "neutral"
             for w in monster.weaknesses:
                 if hasattr(w, "style") and w.style == style:
                     default = w.weakness.value if hasattr(w.weakness, "value") else str(w.weakness)
-            result[style.value] = default
-        return result
+            out[style.value] = default
+        return out
 
     def status(self) -> str:
         r = self.run

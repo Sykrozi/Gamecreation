@@ -67,7 +67,7 @@ def test_skill_room_advance_on_success():
             run.current_room_index = i
             break
 
-    result = runner.complete_skill_room(success=True)
+    result = runner.complete_skill_room(precision=0.9)  # 0.9 > woodcutting threshold at lv1
     assert result.get("success") is True
     assert run.rooms[run.current_room_index - 1].completed is True
 
@@ -88,7 +88,7 @@ def test_skill_room_blocks_on_failure():
             run.current_room_index = i
             break
 
-    result = runner.complete_skill_room(success=False)
+    result = runner.complete_skill_room(precision=0.0)
     assert result.get("blocked") is True
 
 
