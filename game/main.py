@@ -1,170 +1,260 @@
 """
-Game entry point — text-based demo of the combat and dungeon systems.
+Game entry point — text-based demo driven by GameInterface.
 Run: python main.py
 """
 import sys
 import os
 sys.path.insert(0, os.path.dirname(__file__))
 
-from core.constants import CombatAction, CombatStyle, SkillType
-from data.items import WEAPONS
-from entities.player import Player
-from systems.combat import CombatEngine, CombatResult
-from systems.dungeon import DungeonRunner, RoomType, EventType
+from ui.game_interface import GameInterface, GameState
+from core.constants import CombatAction
 
 
-def pick_action(engine: CombatEngine) -> tuple[CombatAction, str | None]:
-    actions = engine.get_valid_actions()
-    print("\nAvailable actions:")
-    for i, action in enumerate(actions):
-        print(f"  {i + 1}. {action.value}")
-    while True:
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+def _hr(char="─", width=54):
+    print(char * width)
+
+
+def _header(text: str):
+    _hr("═")
+    print(f"  {text}")
+    _hr("═")
+
+
+# ─── Combat loop ─────────────────────────────────────────────────────────────
+
+def _run_combat(gi: GameInterface) -> bool:
+    """Returns True if player survived, False if dead."""
+    info = gi.start_combat()
+    if not info["success"]:
+        return True
+
+    print(f"\n  ENEMY: {info['enemy']}  ({info['enemy_hp']} HP)")
+    print(f"  Weaknesses: {info['weaknesses']}")
+
+    while gi.state == GameState.COMBAT:
+        summary = gi.combat_summary()
+        print(f"\n  [Turn {summary['turn']}] "
+              f"You: {summary['player_hp']} HP  |  "
+              f"Enemy: {summary['enemy_hp']} HP")
+
+        actions = summary["actions"]
+        for i, a in enumerate(actions, 1):
+            print(f"    {i}. {a}")
+
         try:
-            choice = int(input("Choose action: ")) - 1
-            if 0 <= choice < len(actions):
-                chosen = actions[choice]
-                item_id = None
-                if chosen == CombatAction.USE_ITEM:
-                    consumables = engine.player.inventory.get_consumables()
-                    if not consumables:
-                        print("No consumables in inventory.")
-                        continue
-                    for j, item in enumerate(consumables):
-                        print(f"  {j + 1}. {item.name}")
-                    ci = int(input("Choose item: ")) - 1
-                    item_id = consumables[ci].id
-                return chosen, item_id
+            choice = int(input("  Action: ")) - 1
+            if not (0 <= choice < len(actions)):
+                raise ValueError
+            action = actions[choice]
         except (ValueError, IndexError):
-            pass
-        print("Invalid choice.")
+            print("  Invalid choice.")
+            continue
 
+        item_id = None
+        if action == CombatAction.USE_ITEM.value:
+            consumables = gi.filter_inventory("consumable")
+            if not consumables:
+                print("  No consumables!")
+                continue
+            for j, c in enumerate(consumables, 1):
+                print(f"    {j}. {c['name']}")
+            try:
+                item_id = consumables[int(input("  Item: ")) - 1]["item_id"]
+            except (ValueError, IndexError):
+                continue
 
-def run_combat_room(runner: DungeonRunner) -> bool:
-    engine = runner.start_combat()
-    if not engine:
-        print("No enemy in this room.")
-        return True
+        result = gi.combat_action(action, item_id=item_id)
+        print(f"\n  >>> {result['narrative']}")
+        if result["effects_applied"]:
+            print(f"      Applied: {result['effects_applied']}")
+        if result["effects_expired"]:
+            print(f"      Expired: {result['effects_expired']}")
 
-    room = runner.current_room
-    print(f"\n{'='*50}")
-    print(f"  COMBAT: {engine.enemy.name}")
-    weaknesses = engine.enemy_weakness_info()
-    print(f"  Weaknesses: {weaknesses}")
-    print(f"{'='*50}")
+        if result["combat_result"] == "VICTORY":
+            resolve = result.get("resolve", {})
+            print(f"\n  [WIN] +{resolve.get('xp', 0)} XP | Drops: {resolve.get('drops', [])}")
+        elif result["combat_result"] == "DEFEAT":
+            print("\n  [DEAD] You have fallen.")
+            return False
+        elif result["combat_result"] == "FLED":
+            print("\n  [FLED] You escaped.")
 
-    while engine.result == CombatResult.ONGOING:
-        print(f"\n{engine.summary()}")
-        action, item_id = pick_action(engine)
-        log = engine.player_action(action, item_id=item_id)
-        print(f"\n>>> {log.narrative}")
-        if log.effects_applied:
-            print(f"    Effects applied: {log.effects_applied}")
-        if log.effects_expired:
-            print(f"    Effects expired: {log.effects_expired}")
-
-    result = runner.resolve_combat(engine)
-    if result["result"] == "win":
-        print(f"\n[WIN] +{result['xp']} XP | Drops: {result['drops']}")
-        return True
-    elif result["result"] == "fled":
-        print("\n[FLED] You escaped.")
-        return True
-    elif result["result"] == "dead":
-        print(f"\n[DEAD] {result['message']}")
-        return False
     return True
 
 
-def run_dungeon(player: Player, zone: str) -> None:
-    runner = DungeonRunner(player, zone)
-    print(f"\n{'#'*50}")
-    print(f"  ENTERING DUNGEON: {zone.upper()}")
-    print(f"  Rooms: {runner.run.total_rooms}")
-    print(f"{'#'*50}")
+# ─── Dungeon loop ─────────────────────────────────────────────────────────────
 
-    while not runner.run.is_complete:
-        room = runner.current_room
-        if not room:
+def _run_dungeon(gi: GameInterface, zone_id: str) -> None:
+    result = gi.enter_zone(zone_id)
+    if not result["success"]:
+        print(f"  Cannot enter: {result['reason']}")
+        return
+
+    _header(f"DUNGEON: {zone_id.upper()}  ({result['total_rooms']} rooms)")
+
+    while gi.state == GameState.DUNGEON:
+        room = gi.current_room()
+        rtype = room.get("type", "?")
+        print(f"\n  ── {rtype.upper()} ──")
+
+        if rtype in ("combat", "boss"):
+            if rtype == "boss":
+                print(f"  BOSS: {room.get('boss', '?')} — {room.get('phases', 1)} phase(s)")
+            alive = _run_combat(gi)
+            if not alive:
+                break
+
+        elif rtype == "skill":
+            print(f"  Skill challenge: {room.get('skill', '?')}")
+            try:
+                prec = float(input("  Precision (0.0–1.0): "))
+            except ValueError:
+                prec = 0.5
+            res = gi.skill_room_attempt(prec)
+            print(f"  {'PASSED' if res.get('success') else 'FAILED'}: "
+                  f"{res.get('narrative', '')}")
+
+        elif rtype == "loot":
+            res = gi.collect_loot_room()
+            print(f"  Loot: {res.get('drops', [])}")
+
+        elif rtype == "event":
+            event = room.get("event", "")
+            print(f"  Event: {event.upper()}")
+            if event == "trap":
+                res = gi.handle_trap()
+                print(f"  Trap! -{res.get('trap_damage', 0)} HP")
+            elif event == "treasure":
+                res = gi.handle_treasure()
+                print(f"  Treasure: {res.get('drops', [])}")
+            elif event == "merchant":
+                shop = gi.get_merchant_shop()
+                print("  Merchant items:")
+                for item in shop.get("items", []):
+                    print(f"    {item['name']} — {item['price_currency']} tokens "
+                          f"/ {item['price_gold']} gold (stock {item['stock']})")
+                bid = input("  Buy item_id (or Enter to skip): ").strip()
+                if bid:
+                    print(f"  {gi.buy_from_merchant(bid)}")
+                gi.dismiss_merchant()
+            else:
+                # elite / rare — combat
+                _run_combat(gi)
+
+        if gi.state == GameState.GAME_OVER:
             break
 
-        print(f"\n--- {runner.status()} ---")
-        info = runner.enter_current_room()
-        print(f"Room type: {info['type'].upper()}")
+    if gi.state == GameState.HUB:
+        _header("DUNGEON COMPLETE — Back at Hub")
 
-        if info["type"] == "combat":
-            alive = run_combat_room(runner)
-            if not alive:
-                break
 
-        elif info["type"] == "boss":
-            print(f"BOSS FIGHT: {info['boss']} ({info['phases']} phases)")
-            alive = run_combat_room(runner)
-            if not alive:
-                break
+# ─── Hub menu ────────────────────────────────────────────────────────────────
 
-        elif info["type"] == "skill":
-            print("SKILL CHALLENGE — Press Enter to attempt...")
-            input()
-            result = runner.complete_skill_room(success=True)
-            print(f"Skill room: {result}")
+def _hub_menu(gi: GameInterface) -> bool:
+    """Returns False when the user wants to quit."""
+    status = gi.hub_status()
+    print(f"\n  Level {status['combat_level']}  |  HP {status['player_hp']}/{status['player_max_hp']}")
+    print(f"  {status['progression']}")
+    _hr()
+    zones = gi.list_zones()
+    print("  Unlocked zones:", [z["id"] for z in zones["unlocked"]])
+    _hr()
+    print("  1. Enter dungeon")
+    print("  2. Inventory")
+    print("  3. Character stats")
+    print("  4. Tick hub (gather resources)")
+    print("  5. Save game")
+    print("  6. Quit")
+    choice = input("> ").strip()
 
-        elif info["type"] == "loot":
-            result = runner.collect_loot_room()
-            print(f"Loot room drops: {result['drops']}")
+    if choice == "1":
+        unlocked = [z["id"] for z in zones["unlocked"]]
+        for i, zid in enumerate(unlocked, 1):
+            print(f"    {i}. {zid}")
+        try:
+            zid = unlocked[int(input("  Zone: ")) - 1]
+        except (ValueError, IndexError):
+            return True
+        _run_dungeon(gi, zid)
 
-        elif info["type"] == "event":
-            event = info["event"]
-            print(f"EVENT: {event.upper()}")
-            if event == EventType.TRAP.value:
-                result = runner.handle_trap_event()
-                print(f"Trap! -{result['trap_damage']} HP | {result['drops']}")
-            elif event == EventType.TREASURE.value:
-                result = runner.handle_treasure_event()
-                print(f"Treasure! {result['drops']}")
-            elif event in (EventType.ELITE.value, EventType.RARE_MONSTER.value):
-                alive = run_combat_room(runner)
-                if not alive:
-                    break
-            elif event == EventType.MERCHANT.value:
-                print("Mysterious Merchant appears... (shop not yet implemented)")
-                runner.run.advance()
-            else:
-                runner.run.advance()
+    elif choice == "2":
+        view = gi.inventory_view()
+        print(f"\n  Gold: {view['gold']}  Tokens: {view['zone_currency']}")
+        print(f"  Slots: {view['slots_used']}/{view['slots_used'] + view['slots_free']}")
+        print("  Equipped:", view["equipped"])
+        print("  Items:")
+        for item in view["inventory"]:
+            print(f"    [{item['type'][0]}] {item['name']} (Lv{item['level_req']}) x{item['quantity']}")
 
-    if runner.run.is_complete and not runner.run.player_died:
-        print(f"\n{'='*50}")
-        print("  DUNGEON COMPLETE!")
-        print(f"  Total drops this run: {runner.run.drops_this_run}")
-        print(f"{'='*50}")
+    elif choice == "3":
+        stats = gi.character_stats()
+        print(f"\n  {stats['name']}  |  Combat Lv {stats['combat_level']}")
+        print(f"  HP: {stats['hp']}/{stats['max_hp']}")
+        for skill_name, data in stats["skills"].items():
+            print(f"    {skill_name:<15} Lv {data['level']:>2} | XP {data['xp']}")
 
+    elif choice == "4":
+        outcomes = gi.hub_tick(5)
+        if outcomes:
+            for o in outcomes:
+                print(f"  +{o['quantity']} {o['resource_id']} | +{o['xp_gained']} XP | {o['narrative']}")
+        else:
+            print("  No gathering buildings active yet.")
+
+    elif choice == "5":
+        path = input("  Save file path [save.json]: ").strip() or "save.json"
+        res = gi.save(path)
+        print(f"  Saved to {res.get('filepath')}" if res["success"] else f"  Failed: {res.get('reason')}")
+
+    elif choice == "6":
+        return False
+
+    return True
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=== Mobile RPG — Foundation Demo ===")
-    name = input("Enter character name: ").strip() or "Hero"
-    player = Player(name=name)
-    player.equipment.weapon = WEAPONS["bronze_sword"]
-    player.active_style = CombatStyle.MELEE
+    gi = GameInterface()
+    _header("MOBILE RPG — GAME INTERFACE DEMO")
 
-    print(f"\nCreated: {player}")
-    print(f"Combat Level: {player.skills.combat_level}")
+    # Check for existing save
+    save_path = "save.json"
+    if os.path.exists(save_path):
+        ans = input(f"  Load existing save '{save_path}'? [y/N]: ").strip().lower()
+        if ans == "y":
+            result = gi.load(save_path)
+            if result["success"]:
+                print(f"  Loaded: {result['name']}")
+            else:
+                print(f"  Load failed: {result['reason']}")
 
-    while True:
-        print("\n--- HUB ---")
-        print("1. Enter Forest dungeon")
-        print("2. View character")
-        print("3. Quit")
-        choice = input("> ").strip()
+    if gi.state == GameState.MAIN_MENU:
+        _header("CHARACTER CREATION")
+        templates = gi.list_templates()
+        for t in templates:
+            ironman_flag = " [IRONMAN]" if t["is_ironman"] else ""
+            print(f"  {t['id']:<10} {t['name']}{ironman_flag}")
+            print(f"             {t['description'][:70]}")
 
-        if choice == "1":
-            run_dungeon(player, "forest")
-        elif choice == "2":
-            print(f"\n{player}")
-            for st in SkillType:
-                skill = player.skills.get(st)
-                print(f"  {skill.skill_type.value:<15} Lv {skill.level:>2} | XP: {skill.xp}")
-        elif choice == "3":
-            print("Goodbye!")
-            break
+        _hr()
+        name = input("  Character name: ").strip() or "Hero"
+        template_id = input("  Template (warrior/ranger/mage/ironman): ").strip() or "warrior"
+
+        result = gi.create_character(name, template_id)
+        if not result["success"]:
+            print(f"  Error: {result['reason']}")
+            sys.exit(1)
+
+        print(f"\n  Created {result['name']} — Combat Lv {result['combat_level']}")
+        print(f"  HP: {result['hp']}/{result['max_hp']}")
+
+    while _hub_menu(gi):
+        pass
+
+    print("\n  Goodbye!")
 
 
 if __name__ == "__main__":
