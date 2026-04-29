@@ -1,9 +1,16 @@
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-*.egg-info/
-dist/
-build/
-.venv/
-venv/
+# Ignore everything on the Desktop except the game project
+*
+!.gitignore
+!game/
+!game/**
+
+# Never commit Python cache or build artefacts
+game/**/__pycache__/
+game/**/*.pyc
+game/**/*.pyo
+game/**/.pytest_cache/
+game/**/*.egg-info/
+game/**/dist/
+game/**/build/
+game/**/.venv/
+game/**/venv/
